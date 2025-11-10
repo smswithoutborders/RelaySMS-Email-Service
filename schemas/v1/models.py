@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
+from typing import Optional
 from pydantic import BaseModel
+
+
+class AliasConfig(BaseModel):
+    """Configuration for SimpleLogin alias."""
+
+    mailbox: str
 
 
 class SendEmailRequest(BaseModel):
     """Request model for sending emails."""
 
+    from_email: str
     to_email: str
     subject: str
-    alias_prefix: str
-    alias_domain: str
-    sender_mailbox: str
-    body: str = None
-    from_name: str = None
-    template: str = None
-    substitutions: dict = None
+    body: Optional[str] = None
+    from_name: Optional[str] = None
+    template: Optional[str] = None
+    substitutions: Optional[dict] = None
+    alias: Optional[AliasConfig] = None
 
 
 class SendEmailResponse(BaseModel):

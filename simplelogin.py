@@ -12,9 +12,9 @@ from email.mime.text import MIMEText
 from typing import Dict, List, Optional, Tuple, Any, Set
 
 import requests
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound, meta
 from logutils import get_logger
 from utils import get_env_var, obfuscate_email
+from smtp_manager import SMTPManager
 
 logger = get_logger(__name__)
 
@@ -22,101 +22,13 @@ logger = get_logger(__name__)
 class SimpleLoginClient:
     """Client for interacting with SimpleLogin API to manage email aliases."""
 
-    def __init__(self):
-        """Initialize SimpleLogin client with API and SMTP configuration."""
+    def __init__(self, smtp_manager: SMTPManager = None):
+        """Initialize SimpleLogin client with API configuration."""
         self.api_base_url = get_env_var(
             "SIMPLELOGIN_API_BASE_URL", "https://app.simplelogin.io/api"
         )
-        self.api_key = get_env_var("SIMPLELOGIN_API_KEY", strict=True)
-        self.smtp_server = get_env_var("SMTP_SERVER", strict=True)
-        self.smtp_port = int(get_env_var("SMTP_PORT", 587))
-        self.smtp_username = get_env_var("SMTP_USERNAME", strict=True)
-        self.smtp_password = get_env_var("SMTP_PASSWORD", strict=True)
-        self.smtp_enable_tls = get_env_var("SMTP_ENABLE_TLS", True)
-        self.template_dir = get_env_var("EMAIL_TEMPLATE_DIR", "email_templates")
-
-        self.jinja_env = Environment(
-            loader=FileSystemLoader(self.template_dir),
-            autoescape=True,
-        )
-
-    def _get_template_variables(self, template_name: str) -> Tuple[bool, Set[str]]:
-        """Extract all variable names used in a Jinja2 template."""
-        try:
-            template_path = f"{self.template_dir}/{template_name}.html"
-            with open(template_path, "r", encoding="utf-8") as f:
-                template_content = f.read()
-
-            ast = self.jinja_env.parse(template_content)
-            variables = meta.find_undeclared_variables(ast)
-            logger.debug("Found variables in template %s: %s", template_name, variables)
-            return True, variables
-        except FileNotFoundError:
-            logger.error("Template not found: %s.html", template_name)
-            return False, set()
-        except Exception as e:
-            logger.error(
-                "Error extracting variables from template %s: %s", template_name, e
-            )
-            return False, set()
-
-    def validate_template_variables(
-        self, template_name: str, substitutions: Dict[str, Any]
-    ) -> Tuple[bool, List[str]]:
-        """Validate that all required template variables are provided in substitutions."""
-        extraction_success, required_variables = self._get_template_variables(
-            template_name
-        )
-
-        if not extraction_success:
-            error_msg = f"Failed to extract variables from template: {template_name}"
-            logger.error(error_msg)
-            return False, [error_msg]
-
-        provided_variables = set(substitutions.keys())
-        missing_variables = list(required_variables - provided_variables)
-
-        is_valid = len(missing_variables) == 0
-
-        if not is_valid:
-            logger.warning(
-                "Template %s missing required variables: %s",
-                template_name,
-                missing_variables,
-            )
-        else:
-            logger.info(
-                "All required variables provided for template %s", template_name
-            )
-
-        return is_valid, missing_variables
-
-    def _load_and_render_template(
-        self, template_name: str, substitutions: Dict[str, Any]
-    ) -> Optional[str]:
-        """Load and render HTML email template with provided substitutions."""
-        try:
-            template = self.jinja_env.get_template(f"{template_name}.html")
-            rendered_content = template.render(substitutions)
-            logger.info("Template %s loaded and rendered successfully", template_name)
-            return rendered_content
-        except TemplateNotFound:
-            logger.error("Template not found: %s.html", template_name)
-            return None
-        except OSError as e:
-            logger.error("Error loading/rendering template %s: %s", template_name, e)
-            return None
-
-    def _render_subject(
-        self, subject_template: str, substitutions: Dict[str, Any]
-    ) -> str:
-        """Render subject template with provided substitutions."""
-        try:
-            template = self.jinja_env.from_string(subject_template)
-            return template.render(substitutions)
-        except (TemplateNotFound, OSError) as e:
-            logger.warning("Error rendering subject template: %s", e)
-            return subject_template
+        self.api_key = get_env_var("SIMPLELOGIN_API_KEY", strict=False)
+        self.smtp_manager = smtp_manager
 
     def _get_headers(self, include_content_type: bool = True) -> Dict[str, str]:
         """Generate API request headers with authentication."""
@@ -279,86 +191,69 @@ class SimpleLoginClient:
         )
         if response:
             action = "retrieved" if response["existed"] else "created"
-            logger.info("Contact %s: %s", action, response["contact"])
+            logger.info("Contact %s: %s", action, obfuscate_email(response["contact"]))
         return response
 
-    def send_via_smtp(
+    def send_via_alias(
         self,
+        mailbox: str,
         from_email: str,
         to_email: str,
         subject: str,
-        body: str,
-        sender_name: str = None,
-    ) -> None:
-        """Send email via configured SMTP server with HTML support."""
-        msg = MIMEMultipart("alternative")
-
-        if sender_name:
-            msg["From"] = f"{sender_name} <{from_email}>"
-        else:
-            msg["From"] = from_email
-
-        msg["To"] = to_email
-        msg["Subject"] = subject
-
-        is_html = body.strip().startswith("<") and ">" in body
-        mime_type = "html" if is_html else "plain"
-        msg.attach(MIMEText(body, mime_type))
-
-        with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-            if self.smtp_enable_tls:
-                server.starttls()
-            server.login(self.smtp_username, self.smtp_password)
-            server.sendmail(from_email, [to_email], msg.as_string())
-
-    def send_email(
-        self,
-        alias_config: Dict[str, str],
-        email_config: Dict[str, str],
-        substitutions: Dict[str, Any] = None,
+        body: Optional[str] = None,
+        template: Optional[str] = None,
+        substitutions: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
-        """Send email using prefix@domain alias with template support.
+        """Send email via SimpleLogin alias.
 
         Args:
-            alias_config: Dict with 'prefix', 'domain', 'mailbox' keys
-            email_config: Dict with 'recipient', 'subject', 'template' or 'body' keys
-            substitutions: Dict with key-value pairs for template substitutions
+            mailbox: Mailbox email with SMTP credentials
+            from_email: Email address for alias (prefix@domain)
+            to_email: Recipient email address
+            subject: Email subject
+            body: Email body (if not using template)
+            template: Template name (if not using body)
+            substitutions: Variables for template/subject rendering
         """
         try:
             if substitutions is None:
                 substitutions = {}
 
-            alias_prefix = alias_config["prefix"]
-            alias_domain = alias_config["domain"]
-            sender_mailbox = alias_config["mailbox"]
-            recipient_email = email_config["recipient"]
-            subject = email_config["subject"]
-            template_name = email_config.get("template")
-            body = email_config.get("body")
+            if not self.api_key:
+                return False, "SimpleLogin API key not configured"
 
-            rendered_subject = self._render_subject(subject, substitutions)
+            if not self.smtp_manager:
+                return False, "SMTP manager not configured"
 
-            if template_name:
-                rendered_body = self._load_and_render_template(
-                    template_name, substitutions
-                )
-                if not rendered_body:
-                    return False, f"Failed to load or render template: {template_name}"
-            elif body:
-                rendered_body = self._render_subject(body, substitutions)
-            else:
+            if not self.smtp_manager.has_config(mailbox):
                 return (
                     False,
-                    "Either 'template' or 'body' must be provided in email_config",
+                    f"No SMTP configuration found for mailbox {obfuscate_email(mailbox)}",
                 )
 
-            alias_email = self.get_or_create_alias(
-                alias_prefix, alias_domain, sender_mailbox
-            )
+            if "@" not in from_email:
+                return False, "Invalid from_email format"
+
+            alias_prefix, alias_domain = from_email.split("@", 1)
+
+            rendered_subject = self.smtp_manager.render_text(subject, substitutions)
+
+            if template:
+                rendered_body = self.smtp_manager.load_and_render_template(
+                    template, substitutions
+                )
+                if not rendered_body:
+                    return False, f"Failed to load or render template: {template}"
+            elif body:
+                rendered_body = self.smtp_manager.render_text(body, substitutions)
+            else:
+                return False, "Either 'template' or 'body' must be provided"
+
+            alias_email = self.get_or_create_alias(alias_prefix, alias_domain, mailbox)
             if not alias_email:
                 return False, "Failed to create or get alias"
 
-            contact = self.add_contact_to_alias(alias_email, recipient_email)
+            contact = self.add_contact_to_alias(alias_email, to_email)
             if not contact:
                 return False, "Failed to add recipient as contact"
 
@@ -369,8 +264,8 @@ class SimpleLoginClient:
             project_name = substitutions.get("project_name", "")
             sender_name = f"{project_name} Team" if project_name else None
 
-            self.send_via_smtp(
-                self.smtp_username,
+            self.smtp_manager.send_email(
+                mailbox,
                 reverse_alias,
                 rendered_subject,
                 rendered_body,
@@ -379,9 +274,10 @@ class SimpleLoginClient:
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info(
-                "Email sent successfully from %s to %s via %s at %s",
+                "Email sent via SimpleLogin from %s (mailbox: %s) to %s via %s at %s",
                 obfuscate_email(alias_email),
-                obfuscate_email(recipient_email),
+                obfuscate_email(mailbox),
+                obfuscate_email(to_email),
                 obfuscate_email(reverse_alias),
                 timestamp,
             )

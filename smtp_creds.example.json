@@ -1,0 +1,20 @@
+{
+  "smtp_accounts": [
+    {
+      "from_email": "user1@example.com",
+      "host": "smtp.gmail.com",
+      "port": 587,
+      "username": "user1@example.com",
+      "password": "your-password-here",
+      "enable_tls": true
+    },
+    {
+      "from_email": "user2@example.com",
+      "host": "smtp.outlook.com",
+      "port": 587,
+      "username": "user2@example.com",
+      "password": "your-password-here",
+      "enable_tls": true
+    }
+  ]
+}
