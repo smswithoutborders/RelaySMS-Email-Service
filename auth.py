@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
-from utils import get_env_var
+import hmac
+
 from logutils import get_logger
+from utils import get_env_var
 
 logger = get_logger(__name__)
 
@@ -18,4 +20,4 @@ def authenticate_api_key(api_key: str) -> bool:
     Return:
         bool: True if valid, False otherwise.
     """
-    return api_key == API_KEY
+    return hmac.compare_digest(api_key, API_KEY)
